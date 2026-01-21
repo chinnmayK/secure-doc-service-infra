@@ -498,3 +498,20 @@ resource "aws_iam_role_policy_attachment" "ec2_dynamodb" {
   role       = aws_iam_role.ec2_role.name
   policy_arn = aws_iam_policy.dynamodb_write.arn
 }
+
+# --------------------
+# VPC Endpoint for DynamoDB (COST OPTIMIZATION)
+# --------------------
+resource "aws_vpc_endpoint" "dynamodb" {
+  vpc_id            = aws_vpc.this.id
+  service_name      = "com.amazonaws.${var.aws_region}.dynamodb"
+  vpc_endpoint_type = "Gateway"
+
+  route_table_ids = [
+    aws_route_table.private.id
+  ]
+
+  tags = {
+    Name = "${var.project_name}-${var.environment}-dynamodb-endpoint"
+  }
+}
