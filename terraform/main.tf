@@ -89,6 +89,8 @@ resource "aws_route_table" "public" {
 }
 
 resource "aws_route_table" "private" {
+  depends_on = [aws_nat_gateway.this]
+
   vpc_id = aws_vpc.this.id
 
   route {
@@ -272,20 +274,37 @@ locals {
     dnf update -y
     dnf install -y python3 python3-pip logrotate
 
+    # --------------------
+    # Environment variable (Terraform injects value)
+    # --------------------
+    export DDB_TABLE_NAME="${aws_dynamodb_table.documents.name}"
+    export AWS_DEFAULT_REGION="${var.aws_region}"
+    export AWS_REGION="${var.aws_region}"
+
     mkdir -p /opt/document-service/uploads
     mkdir -p /var/log/app
 
-    chown -R ec2-user:ec2-user /opt/document-service /var/log/app
+    # App directory owned by ec2-user (fine)
+    chown -R ec2-user:ec2-user /opt/document-service
 
-    pip3 install flask werkzeug
+    # Log directory owned by root (correct for system logs)
+    chmod 755 /var/log/app
+    touch /var/log/app/document-service.log
+    chown -R root:root /var/log/app
+    chmod 644 /var/log/app/document-service.log
+
+
+    pip3 install flask werkzeug boto3
 
     # --------------------
     # Create Flask application
     # --------------------
     cat << 'APP' > /opt/document-service/app.py
-    from flask import Flask, request
+    from flask import Flask, request, jsonify
     import os, logging
     from datetime import datetime
+    import boto3
+    import uuid
 
     UPLOAD_DIR = "/opt/document-service/uploads"
     LOG_FILE = "/var/log/app/document-service.log"
@@ -300,6 +319,16 @@ locals {
 
     app = Flask(__name__)
 
+    region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "ap-south-1"
+    dynamodb = boto3.resource("dynamodb", region_name=region)
+
+    table_name = os.environ.get("DDB_TABLE_NAME")
+
+    if not table_name:
+        raise RuntimeError("DDB_TABLE_NAME not set")
+
+    table = dynamodb.Table(table_name)
+
     @app.route("/upload", methods=["POST"])
     def upload():
         if "file" not in request.files:
@@ -310,14 +339,19 @@ locals {
         path = os.path.join(UPLOAD_DIR, file.filename)
         file.save(path)
 
-        meta = {
+        document_id = str(uuid.uuid4())
+
+        item = {
+            "document_id": document_id,
             "filename": file.filename,
-            "size": os.path.getsize(path),
+            "size_bytes": os.path.getsize(path),
             "uploaded_at": datetime.utcnow().isoformat()
         }
 
-        logging.info(f"Uploaded: {meta}")
-        return meta, 201
+        table.put_item(Item=item)
+
+        logging.info(f"Metadata stored: {item}")
+        return item, 201
 
     @app.route("/status")
     def status():
@@ -390,13 +424,18 @@ data "aws_ami" "amazon_linux" {
 }
 
 resource "aws_autoscaling_group" "this" {
+  depends_on = [
+    aws_lb_listener.http
+  ]
+
   name                      = "${var.project_name}-${var.environment}-asg"
   desired_capacity          = 1
   min_size                  = 1
-  max_size                  = 2
+  max_size                  = 1
   vpc_zone_identifier       = aws_subnet.private[*].id
   health_check_type         = "ELB"
   health_check_grace_period = 180
+  default_cooldown          = 300
   target_group_arns         = [aws_lb_target_group.app.arn]
 
   launch_template {
@@ -416,4 +455,46 @@ resource "aws_autoscaling_group" "this" {
     value               = "${var.project_name}-${var.environment}-asg"
     propagate_at_launch = true
   }
+}
+
+
+# --------------------
+# DynamoDB Table (Document Metadata)
+# --------------------
+resource "aws_dynamodb_table" "documents" {
+  name         = "${var.project_name}-${var.environment}-documents"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "document_id"
+
+  attribute {
+    name = "document_id"
+    type = "S"
+  }
+
+  tags = {
+    Name = "${var.project_name}-${var.environment}-documents"
+  }
+}
+
+# --------------------
+# DynamoDB Write Policy
+# --------------------
+resource "aws_iam_policy" "dynamodb_write" {
+  name = "${var.project_name}-${var.environment}-dynamodb-write"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "dynamodb:PutItem"
+      ]
+      Resource = aws_dynamodb_table.documents.arn
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ec2_dynamodb" {
+  role       = aws_iam_role.ec2_role.name
+  policy_arn = aws_iam_policy.dynamodb_write.arn
 }
