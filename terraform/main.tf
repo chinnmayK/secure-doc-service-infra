@@ -1,3 +1,23 @@
+# ==============================================================================
+# DATA SOURCES
+# ==============================================================================
+
+data "aws_availability_zones" "available" {}
+
+data "aws_ami" "amazon_linux" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["al2023-ami-*-x86_64"]
+  }
+}
+
+# ==============================================================================
+# NETWORKING
+# ==============================================================================
+
 # --------------------
 # VPC
 # --------------------
@@ -118,10 +138,96 @@ resource "aws_route_table_association" "private" {
   route_table_id = aws_route_table.private.id
 }
 
+# ==============================================================================
+# VPC ENDPOINTS
+# ==============================================================================
+
 # --------------------
-# Availability Zones
+# Security Group for VPC Interface Endpoints
 # --------------------
-data "aws_availability_zones" "available" {}
+resource "aws_security_group" "vpce_sg" {
+  name        = "${var.project_name}-${var.environment}-vpce-sg"
+  description = "Allow HTTPS from VPC to VPC endpoints"
+  vpc_id      = aws_vpc.this.id
+
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = [var.vpc_cidr]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "${var.project_name}-${var.environment}-vpce-sg"
+  }
+}
+
+# --------------------
+# VPC Endpoint for DynamoDB (COST OPTIMIZATION)
+# --------------------
+resource "aws_vpc_endpoint" "dynamodb" {
+  vpc_id            = aws_vpc.this.id
+  service_name      = "com.amazonaws.${var.aws_region}.dynamodb"
+  vpc_endpoint_type = "Gateway"
+
+  route_table_ids = [
+    aws_route_table.private.id
+  ]
+
+  tags = {
+    Name = "${var.project_name}-${var.environment}-dynamodb-endpoint"
+  }
+}
+
+resource "aws_vpc_endpoint" "ssm" {
+  vpc_id              = aws_vpc.this.id
+  service_name        = "com.amazonaws.${var.aws_region}.ssm"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = aws_subnet.private[*].id
+  security_group_ids  = [aws_security_group.vpce_sg.id]
+  private_dns_enabled = true
+
+  tags = {
+    Name = "${var.project_name}-${var.environment}-ssm-endpoint"
+  }
+}
+
+resource "aws_vpc_endpoint" "ec2messages" {
+  vpc_id              = aws_vpc.this.id
+  service_name        = "com.amazonaws.${var.aws_region}.ec2messages"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = aws_subnet.private[*].id
+  security_group_ids  = [aws_security_group.vpce_sg.id]
+  private_dns_enabled = true
+
+  tags = {
+    Name = "${var.project_name}-${var.environment}-ec2messages-endpoint"
+  }
+}
+
+resource "aws_vpc_endpoint" "ssmmessages" {
+  vpc_id              = aws_vpc.this.id
+  service_name        = "com.amazonaws.${var.aws_region}.ssmmessages"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = aws_subnet.private[*].id
+  security_group_ids  = [aws_security_group.vpce_sg.id]
+  private_dns_enabled = true
+
+  tags = {
+    Name = "${var.project_name}-${var.environment}-ssmmessages-endpoint"
+  }
+}
+
+# ==============================================================================
+# SECURITY GROUPS
+# ==============================================================================
 
 # --------------------
 # ALB Security Group
@@ -181,6 +287,10 @@ resource "aws_security_group" "ec2_sg" {
   }
 }
 
+# ==============================================================================
+# LOAD BALANCER
+# ==============================================================================
+
 # --------------------
 # Application Load Balancer
 # --------------------
@@ -209,10 +319,10 @@ resource "aws_lb_target_group" "app" {
   health_check {
     enabled             = true
     path                = "/status"
-    healthy_threshold   = 2
-    unhealthy_threshold = 2
+    healthy_threshold   = 3
+    unhealthy_threshold = 3
     timeout             = 5
-    interval            = 15
+    interval            = 20
     matcher             = "200"
   }
 
@@ -234,6 +344,10 @@ resource "aws_lb_listener" "http" {
     target_group_arn = aws_lb_target_group.app.arn
   }
 }
+
+# ==============================================================================
+# IAM ROLES & POLICIES
+# ==============================================================================
 
 # --------------------
 # IAM Role for EC2
@@ -262,6 +376,33 @@ resource "aws_iam_instance_profile" "ec2_profile" {
   name = "${var.project_name}-${var.environment}-ec2-profile"
   role = aws_iam_role.ec2_role.name
 }
+
+# --------------------
+# DynamoDB Write Policy
+# --------------------
+resource "aws_iam_policy" "dynamodb_write" {
+  name = "${var.project_name}-${var.environment}-dynamodb-write"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "dynamodb:PutItem"
+      ]
+      Resource = aws_dynamodb_table.documents.arn
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ec2_dynamodb" {
+  role       = aws_iam_role.ec2_role.name
+  policy_arn = aws_iam_policy.dynamodb_write.arn
+}
+
+# ==============================================================================
+# COMPUTE (EC2 AUTO SCALING)
+# ==============================================================================
 
 # --------------------
 # User Data Script
@@ -388,7 +529,7 @@ locals {
 }
 
 resource "aws_launch_template" "this" {
-  name_prefix   = "${var.project_name}-${var.environment}-lt"
+  name_prefix   = "${var.project_name}-${var.environment}-lt-"
   image_id      = data.aws_ami.amazon_linux.id
   instance_type = "t3.micro"
 
@@ -405,29 +546,24 @@ resource "aws_launch_template" "this" {
 
   user_data = base64encode(local.user_data)
 
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 2
+  }
+
   tag_specifications {
     resource_type = "instance"
+
     tags = {
       Name = "${var.project_name}-${var.environment}-ec2"
     }
   }
 }
 
-data "aws_ami" "amazon_linux" {
-  most_recent = true
-  owners      = ["amazon"]
-
-  filter {
-    name   = "name"
-    values = ["al2023-ami-*-x86_64"]
-  }
-}
-
 resource "aws_autoscaling_group" "this" {
-  depends_on = [
-    aws_lb_listener.http
-  ]
-
+  protect_from_scale_in     = true
+  depends_on                = [aws_lb_listener.http]
   name                      = "${var.project_name}-${var.environment}-asg"
   desired_capacity          = 1
   min_size                  = 1
@@ -457,6 +593,9 @@ resource "aws_autoscaling_group" "this" {
   }
 }
 
+# ==============================================================================
+# DATABASE (DynamoDB)
+# ==============================================================================
 
 # --------------------
 # DynamoDB Table (Document Metadata)
@@ -473,111 +612,5 @@ resource "aws_dynamodb_table" "documents" {
 
   tags = {
     Name = "${var.project_name}-${var.environment}-documents"
-  }
-}
-
-# --------------------
-# DynamoDB Write Policy
-# --------------------
-resource "aws_iam_policy" "dynamodb_write" {
-  name = "${var.project_name}-${var.environment}-dynamodb-write"
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect = "Allow"
-      Action = [
-        "dynamodb:PutItem"
-      ]
-      Resource = aws_dynamodb_table.documents.arn
-    }]
-  })
-}
-
-resource "aws_iam_role_policy_attachment" "ec2_dynamodb" {
-  role       = aws_iam_role.ec2_role.name
-  policy_arn = aws_iam_policy.dynamodb_write.arn
-}
-
-# --------------------
-# VPC Endpoint for DynamoDB (COST OPTIMIZATION)
-# --------------------
-resource "aws_vpc_endpoint" "dynamodb" {
-  vpc_id            = aws_vpc.this.id
-  service_name      = "com.amazonaws.${var.aws_region}.dynamodb"
-  vpc_endpoint_type = "Gateway"
-
-  route_table_ids = [
-    aws_route_table.private.id
-  ]
-
-  tags = {
-    Name = "${var.project_name}-${var.environment}-dynamodb-endpoint"
-  }
-}
-
-# --------------------
-# Security Group for VPC Interface Endpoints
-# --------------------
-resource "aws_security_group" "vpce_sg" {
-  name        = "${var.project_name}-${var.environment}-vpce-sg"
-  description = "Allow HTTPS from VPC to VPC endpoints"
-  vpc_id      = aws_vpc.this.id
-
-  ingress {
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = [var.vpc_cidr]
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = {
-    Name = "${var.project_name}-${var.environment}-vpce-sg"
-  }
-}
-
-resource "aws_vpc_endpoint" "ssm" {
-  vpc_id              = aws_vpc.this.id
-  service_name        = "com.amazonaws.${var.aws_region}.ssm"
-  vpc_endpoint_type   = "Interface"
-  subnet_ids          = aws_subnet.private[*].id
-  security_group_ids  = [aws_security_group.vpce_sg.id]
-  private_dns_enabled = true
-
-  tags = {
-    Name = "${var.project_name}-${var.environment}-ssm-endpoint"
-  }
-}
-
-resource "aws_vpc_endpoint" "ec2messages" {
-  vpc_id              = aws_vpc.this.id
-  service_name        = "com.amazonaws.${var.aws_region}.ec2messages"
-  vpc_endpoint_type   = "Interface"
-  subnet_ids          = aws_subnet.private[*].id
-  security_group_ids  = [aws_security_group.vpce_sg.id]
-  private_dns_enabled = true
-
-  tags = {
-    Name = "${var.project_name}-${var.environment}-ec2messages-endpoint"
-  }
-}
-
-resource "aws_vpc_endpoint" "ssmmessages" {
-  vpc_id              = aws_vpc.this.id
-  service_name        = "com.amazonaws.${var.aws_region}.ssmmessages"
-  vpc_endpoint_type   = "Interface"
-  subnet_ids          = aws_subnet.private[*].id
-  security_group_ids  = [aws_security_group.vpce_sg.id]
-  private_dns_enabled = true
-
-  tags = {
-    Name = "${var.project_name}-${var.environment}-ssmmessages-endpoint"
   }
 }
