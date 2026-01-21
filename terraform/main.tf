@@ -232,3 +232,154 @@ resource "aws_lb_listener" "http" {
     target_group_arn = aws_lb_target_group.app.arn
   }
 }
+
+# --------------------
+# IAM Role for EC2
+# --------------------
+resource "aws_iam_role" "ec2_role" {
+  name = "${var.project_name}-${var.environment}-ec2-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = {
+        Service = "ec2.amazonaws.com"
+      }
+      Action = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ec2_ssm" {
+  role       = aws_iam_role.ec2_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_instance_profile" "ec2_profile" {
+  name = "${var.project_name}-${var.environment}-ec2-profile"
+  role = aws_iam_role.ec2_role.name
+}
+
+# --------------------
+# User Data Script
+# --------------------
+locals {
+  user_data = <<-EOF
+    #!/bin/bash
+    set -xe
+
+    dnf update -y
+    dnf install -y python3 python3-pip
+
+    mkdir -p /opt/document-service/uploads
+    mkdir -p /var/log/app
+
+    chown -R ec2-user:ec2-user /opt/document-service /var/log/app
+
+    pip3 install flask werkzeug
+
+    cat << 'APP' > /opt/document-service/app.py
+    from flask import Flask, request, jsonify
+    import os, logging
+    from datetime import datetime
+
+    UPLOAD_DIR = "/opt/document-service/uploads"
+    LOG_FILE = "/var/log/app/document-service.log"
+
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+    logging.basicConfig(
+        filename=LOG_FILE,
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s"
+    )
+
+    app = Flask(__name__)
+
+    @app.route("/upload", methods=["POST"])
+    def upload():
+        if "file" not in request.files:
+            logging.error("Missing file")
+            return {"error": "file required"}, 400
+
+        file = request.files["file"]
+        path = os.path.join(UPLOAD_DIR, file.filename)
+        file.save(path)
+
+        meta = {
+            "filename": file.filename,
+            "size": os.path.getsize(path),
+            "uploaded_at": datetime.utcnow().isoformat()
+        }
+
+        logging.info(f"Uploaded: {meta}")
+        return meta, 201
+
+    @app.route("/status")
+    def status():
+        return {"service": "document-metadata", "status": "running"}, 200
+
+    if __name__ == "__main__":
+        app.run(host="0.0.0.0", port=8080)
+    APP
+
+    nohup python3 /opt/document-service/app.py > /var/log/app/app.out 2>&1 &
+  EOF
+}
+
+resource "aws_launch_template" "this" {
+  name_prefix   = "${var.project_name}-${var.environment}-lt"
+  image_id      = data.aws_ami.amazon_linux.id
+  instance_type = "t3.micro"
+
+  iam_instance_profile {
+    name = aws_iam_instance_profile.ec2_profile.name
+  }
+
+  network_interfaces {
+    security_groups             = [aws_security_group.ec2_sg.id]
+    associate_public_ip_address = false
+  }
+
+  user_data = base64encode(local.user_data)
+
+  tag_specifications {
+    resource_type = "instance"
+    tags = {
+      Name = "${var.project_name}-${var.environment}-ec2"
+    }
+  }
+}
+
+data "aws_ami" "amazon_linux" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["al2023-ami-*-x86_64"]
+  }
+}
+
+resource "aws_autoscaling_group" "this" {
+  name                      = "${var.project_name}-${var.environment}-asg"
+  desired_capacity          = 1
+  min_size                  = 1
+  max_size                  = 2
+  vpc_zone_identifier       = aws_subnet.private[*].id
+  health_check_type         = "ELB"
+  health_check_grace_period = 180
+  target_group_arns         = [aws_lb_target_group.app.arn]
+
+  launch_template {
+    id      = aws_launch_template.this.id
+    version = "$Latest"
+  }
+
+  tag {
+    key                 = "Name"
+    value               = "${var.project_name}-${var.environment}-asg"
+    propagate_at_launch = true
+  }
+}
