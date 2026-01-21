@@ -270,7 +270,7 @@ locals {
     set -xe
 
     dnf update -y
-    dnf install -y python3 python3-pip
+    dnf install -y python3 python3-pip logrotate
 
     mkdir -p /opt/document-service/uploads
     mkdir -p /var/log/app
@@ -279,8 +279,11 @@ locals {
 
     pip3 install flask werkzeug
 
+    # --------------------
+    # Create Flask application
+    # --------------------
     cat << 'APP' > /opt/document-service/app.py
-    from flask import Flask, request, jsonify
+    from flask import Flask, request
     import os, logging
     from datetime import datetime
 
@@ -324,6 +327,28 @@ locals {
         app.run(host="0.0.0.0", port=8080)
     APP
 
+    # --------------------
+    # Logrotate configuration (must run as root)
+    # --------------------
+    cat << 'ROTATE' | tee /etc/logrotate.d/document-service > /dev/null
+    /var/log/app/*.log /var/log/app/*.out {
+        daily
+        rotate 7
+        compress
+        missingok
+        notifempty
+        copytruncate
+    }
+    ROTATE
+
+    # --------------------
+    # OPTIONAL — Proof marker to verify user data execution
+    # --------------------
+    echo "logrotate-config-created" > /var/log/app/logrotate.marker
+
+    # --------------------
+    # Run application
+    # --------------------
     nohup python3 /opt/document-service/app.py > /var/log/app/app.out 2>&1 &
   EOF
 }
@@ -332,6 +357,8 @@ resource "aws_launch_template" "this" {
   name_prefix   = "${var.project_name}-${var.environment}-lt"
   image_id      = data.aws_ami.amazon_linux.id
   instance_type = "t3.micro"
+
+  update_default_version = true
 
   iam_instance_profile {
     name = aws_iam_instance_profile.ec2_profile.name
@@ -375,6 +402,13 @@ resource "aws_autoscaling_group" "this" {
   launch_template {
     id      = aws_launch_template.this.id
     version = "$Latest"
+  }
+
+  instance_refresh {
+    strategy = "Rolling"
+    preferences {
+      min_healthy_percentage = 0
+    }
   }
 
   tag {
